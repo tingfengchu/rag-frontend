@@ -105,3 +105,15 @@ code {
   padding: 4px 8px;
   background: var(--code-bg);
 }
+
+/* 流式回答的"打字机"光标：AI 还在吐字时跟在文本末尾闪烁。
+   放在全局 CSS 而不是内联样式里，因为 @keyframes 无法内联。 */
+.chat-cursor {
+  animation: chat-cursor-blink 1s step-end infinite;
+}
+
+@keyframes chat-cursor-blink {
+  50% {
+    opacity: 0;
+  }
+}

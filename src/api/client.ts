@@ -91,3 +91,173 @@ api.interceptors.response.use(
     return Promise.reject(error)
   },
 )
+
+/* ============================ 流式问答（SSE） ============================ */
+
+/**
+ * 重排模型白名单，对应后端 ``schemas.RERANK_MODEL_CHOICES``。
+ *
+ * 后端刻意用 Literal 而不是自由字符串：模型名会被拿去 HF 加载（真实下载 + 常驻内存），
+ * 放开就等于给了一个资源滥用入口。前端必须按同一份清单给选项，否则 422。
+ */
+export type RerankModelName =
+  | 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+  | 'BAAI/bge-reranker-base'
+
+export const RERANK_MODELS: { value: RerankModelName; label: string }[] = [
+  {
+    value: 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+    label: 'ms-marco-MiniLM-L-6-v2（通用）',
+  },
+  { value: 'BAAI/bge-reranker-base', label: 'bge-reranker-base（中文推荐）' },
+]
+
+/**
+ * 流式问答请求体，对应后端 ``schemas.ChatIn``。
+ *
+ * ⚠️ 字段名以**后端为准**：是 ``file_uuid``（不是 selected_file_uuid）。
+ * ``scope`` 只接受 ``"public"`` 或 ``"private:<自己的 user_uuid>"``——
+ * 其余取值会被 ``api/deps.resolve_scope`` 判为 400 / 403，前端不该靠猜。
+ */
+export interface ChatStreamPayload {
+  question: string
+  scope: string
+  enable_rerank: boolean
+  rerank_model: RerankModelName
+  /** 限定检索单个文件；null / 省略 = 该库全部文件 */
+  file_uuid?: string | null
+}
+
+/** 引用来源（后端 ``Citation``）。 */
+export interface Citation {
+  source: string
+  page: number
+}
+
+/** 命中片段详情（后端 ``DebugChunk``）——留给后续"调试面板"，当前不渲染。 */
+export interface DebugChunk {
+  length: number
+  is_parent: boolean
+  preview: string
+  rerank_score: number
+}
+
+/**
+ * ``meta`` 事件载荷。
+ *
+ * 字段全部可选是**有意为之**：后端在不同时机各发一部分——
+ * 流一开始发 ``{scope, question, rewritten_question, rewritten}``；
+ * 命中缓存时补一帧 ``{cached: true}``；模型输出被判为拒答时补 ``{refused: true}``。
+ * 所以前端必须按"增量补丁"处理，不能假设一次拿全。
+ */
+export interface ChatMeta {
+  scope?: string
+  question?: string
+  rewritten_question?: string
+  rewritten?: boolean
+  cached?: boolean
+  refused?: boolean
+}
+
+/** ``done`` 事件载荷：完整答案，前端可用它整段替换逐 token 拼出来的结果。 */
+export interface ChatDoneResult {
+  question: string
+  rewritten_question: string
+  answer: string
+  citations: Citation[]
+  scope: string
+  cached: boolean
+  max_score: number
+  refused: boolean
+}
+
+/** 流式接口的失败（HTTP 非 2xx，或响应没有 body）。 */
+export class ChatStreamError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ChatStreamError'
+    this.status = status
+  }
+}
+
+/** ``SSEChat`` 的返回值：调用方自己读 reader，并负责解析 SSE 帧。 */
+export interface ChatStreamHandle {
+  response: Response
+  reader: ReadableStreamDefaultReader<Uint8Array>
+}
+
+/**
+ * 发起流式问答，返回响应体的 reader（由调用方持续 read）。
+ *
+ * 为什么用 fetch 而不是本文件里那个 axios 实例：
+ * 浏览器端 axios 底层是 XHR，**拿不到增量响应**——它必须等整个响应结束才 resolve，
+ * 流式渲染就无从谈起。fetch + ReadableStream 才能一块一块地读。
+ *
+ * ``credentials: 'include'`` 必须有：会话在 HttpOnly Cookie 里，漏了这行必然 401。
+ * 开发期（Vite 代理）与生产（nginx 同源）下浏览器本来就带 Cookie，显式写出来
+ * 才能在真跨域（后端配了 CORS + allow_credentials）时同样正确。
+ *
+ * 另外**不加超时**：一次问答要跑检索 + LLM 生成，几十秒很正常；
+ * 这里套用 axios 那 30s 超时只会把正常的长回答掐断。要中断请传 AbortSignal。
+ */
+export async function SSEChat(
+  payload: ChatStreamPayload,
+  options: { signal?: AbortSignal } = {},
+): Promise<ChatStreamHandle> {
+  const response = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(payload),
+    credentials: 'include',
+    signal: options.signal,
+  })
+
+  if (!response.ok) {
+    throw new ChatStreamError(response.status, await readErrorDetail(response))
+  }
+
+  const body = response.body
+  if (!body) {
+    // 正常浏览器不会走到这里；被代理/插件改写响应时可能出现
+    throw new ChatStreamError(response.status, '当前浏览器未提供流式响应体')
+  }
+  return { response, reader: body.getReader() }
+}
+
+/**
+ * 取出失败响应里的中文 detail（后端统一格式 ``{"detail": "..."}``）。
+ *
+ * 流式接口是 fetch，``extractErrorMessage``（只认 axios 错误）在这里用不上，
+ * 所以单独补一个。不是 JSON 时（例如 nginx 直接吐 502 HTML）回落一句按状态码的人话。
+ */
+async function readErrorDetail(response: Response): Promise<string> {
+  try {
+    const data = (await response.json()) as { detail?: unknown }
+    if (typeof data.detail === 'string' && data.detail) return data.detail
+  } catch {
+    // 非 JSON 响应 —— 落到下面的兜底文案
+  }
+  if (response.status === 401) return '登录状态已失效，请重新登录'
+  return `请求失败（HTTP ${response.status}）`
+}
+
+/** 文件列表项（后端 ``FileOut``）。 */
+export interface ApiFile {
+  file_uuid: string
+  file_name: string
+  source: string
+}
+
+/** 列出某库中已成功入库的文件；用于侧栏的"文件级过滤"下拉。 */
+export async function listFiles(scope: string): Promise<ApiFile[]> {
+  // 走 axios：401 交给全局拦截器统一处理，前端不必到处写登录跳转
+  const { data } = await api.get<ApiFile[]>('/files', { params: { scope } })
+  return data
+}
+
+/** 清空后端对话历史（Redis，按 user + scope 隔离）。 */
+export async function clearHistory(scope: string): Promise<void> {
+  await api.delete('/history', { params: { scope } })
+}
