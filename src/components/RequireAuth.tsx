@@ -56,7 +56,20 @@ type AuthState =
  * * 其它错误（后端没起、超时、5xx）→ **不跳登录页**。这时用户其实没掉登录态，
  *   把人踢到登录页会让他以为是自己密码错了、白输一遍——显示错误 + 重试更诚实。
  */
-export default function RequireAuth({ children }: { children: ReactNode }) {
+export default function RequireAuth({
+  children,
+  adminOnly = false,
+}: {
+  children: ReactNode
+  /**
+   * 只允许管理员（模块 6 的 ``/admin`` 运营看板）。
+   *
+   * 为什么前端也拦一道：后端 ``GET /api/admin/stats`` 本来就会 403（权限的唯一权威），
+   * 但若把页面渲染出来、让它在加载统计时弹个红条，用户只会以为"看板坏了"。
+   * 这里只负责**说清楚为什么进不去**，不承担任何安全职责。
+   */
+  adminOnly?: boolean
+}) {
   const navigate = useNavigate()
   const [state, setState] = useState<AuthState>({ status: 'checking' })
   // 自增后触发 useEffect 重跑 = "重试"；比把探测逻辑抽成 useCallback 更直白
@@ -105,6 +118,21 @@ export default function RequireAuth({ children }: { children: ReactNode }) {
             }}
           >
             重试
+          </Button>
+        }
+      />
+    )
+  }
+
+  if (adminOnly && state.user.role !== 'admin') {
+    return (
+      <Result
+        status="403"
+        title="需要管理员权限"
+        subTitle={`当前账号「${state.user.username}」不是管理员，运营看板只对管理员开放。`}
+        extra={
+          <Button type="primary" onClick={() => navigate('/chat')}>
+            返回对话
           </Button>
         }
       />
